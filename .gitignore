@@ -1,0 +1,6 @@
+*.o
+motor
+testes
+save.txt
+*.save
+jogo_guardado.txt
