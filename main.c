@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>     /* getpid() — entropia extra para o srand */
 #include "motor.h"
 #include "interface.h"
 #include "regras.h"
@@ -22,29 +23,36 @@ static void pausa(void) {
     lerLinha(buf, sizeof(buf));
 }
 
-/* Trata o comando "move <origem> <destino>" (o nº de cartas é automático).
- * Guarda o estado antes da jogada (para desfazer) e dispara os AUTO. */
+/* Trata o comando "move <origem> <destino> [n]". Se o jogador indicar 'n',
+ * move exatamente n cartas (ex: "move 3 5 2"); caso contrário escolhe sozinho
+ * a maior sequência válida. Guarda o estado antes da jogada (undo) e dispara
+ * os AUTO. */
 static void comandoMover(MotorPaciencia *m, const char *buf) {
     char cmd[16];
-    int o = -1, d = -1;
-    
-    // Parse inteligente: O jogador escreve "move 3 5", e o sscanf distribui os valores
-    // pelas variáveis 'cmd', 'o' (origem) e 'd' (destino). Se falhar a extração de 3 partes, dá erro.
-    if (sscanf(buf, "%15s %d %d", cmd, &o, &d) < 3) {
-        printf("Sintaxe: move <origem> <destino>\n");
+    int o = -1, d = -1, n = -1;
+
+    // Parse inteligente: O jogador escreve "move 3 5 2", e o sscanf distribui os valores
+    // pelas variáveis 'cmd', 'o', 'd' e 'n'. O 4.º campo é opcional.
+    int campos = sscanf(buf, "%15s %d %d %d", cmd, &o, &d, &n);
+    if (campos < 3) {
+        printf("Sintaxe: move <origem> <destino> [n]\n");
         return;
     }
-    
+
     guardarHistorico(m); // Checkpoint obrigatório ANTES de alterar a mesa
-    
-    if (executarMovimentoAuto(m, o, d) == 0) {
+
+    // Se o utilizador deu 'n', usa-o; caso contrário deixa o motor escolher.
+    int ok = (campos >= 4) ? executarMovimento(m, o, d, n)
+                           : executarMovimentoAuto(m, o, d);
+
+    if (ok == 0) {
         descartarHistorico(m);             /* jogada inválida: anula o snapshot para poupar memória */
         printf("Jogada invalida.\n");
         pausa();
     } else
         // Reacção em cadeia: O jogo verifica autonomamente se a jogada do utilizador
         // ativou alguma regra automática (ex: mandar cartas para a fundação)
-        aplicarAutomaticos(m);             
+        aplicarAutomaticos(m);
 }
 
 // Desfaz a última jogada ou avisa que não há histórico.
@@ -68,29 +76,39 @@ static void comandoDica(MotorPaciencia *m) {
     }
 }
 
-/* Guarda o jogo num ficheiro (por omissão "jogo_guardado.txt"), para o
- * poderes retomar mais tarde com 'carregar'. */
+/* Guarda o jogo num ficheiro dentro da pasta "saves/" com a extensão .save
+ * (por omissão "saves/jogo_guardado.save"). O ficheiro.c trata dos caminhos. */
 static void comandoGravar(MotorPaciencia *m, const char *buf) {
-    char cmd[16], nome[64] = "jogo_guardado.txt";
-    // Tenta extrair um nome de ficheiro opcional (ex: "guardar jogo2"). Se não houver, usa o omissão.
+    char cmd[16], nome[64] = "jogo_guardado";
+    // Tenta extrair um nome de ficheiro opcional (ex: "guardar partida1"). Se não houver, usa o omissão.
     sscanf(buf, "%15s %63s", cmd, nome);
-    if (gravarJogo(m, nome))
-        printf("Jogo guardado em '%s'. Usa 'c %s' para voltar a este ponto.\n", nome, nome);
-    else
-        printf("Nao foi possivel guardar em '%s'.\n", nome);
+    if (gravarJogo(m, nome)) {
+        // Se o utilizador deu um caminho com '/' (ex: /tmp/foo), o ficheiro.c respeita-o;
+        // caso contrário cai em saves/<nome>.save. Mostramos a mensagem correta.
+        if (strchr(nome, '/') != NULL)
+            printf("Jogo guardado em '%s'. Usa 'c %s' para voltar a este ponto.\n", nome, nome);
+        else
+            printf("Jogo guardado em 'saves/%s.save'. Usa 'c %s' para voltar a este ponto.\n", nome, nome);
+    } else
+        printf("Nao foi possivel guardar o jogo (verifica permissoes da pasta saves/).\n");
     pausa();
 }
 
-/* Carrega um jogo guardado (por omissão "jogo_guardado.txt"). */
+/* Carrega um jogo guardado. Aceita nomes curtos ("partida1"), com extensão
+ * ("partida1.save") ou caminhos completos ("golf-nearwin.save"). */
 static void comandoCarregar(MotorPaciencia *m, const char *buf) {
-    char cmd[16], nome[64] = "jogo_guardado.txt";
+    char cmd[16], nome[64] = "jogo_guardado";
     sscanf(buf, "%15s %63s", cmd, nome);
-    
+
     // O carregarJogo substitui o estado inteiro do Motor (m) pelo que estava no disco.
-    if (carregarJogo(m, nome))
+    if (carregarJogo(m, nome)) {
+        // Aplica AUTO ao estado carregado: se a save foi feita à mão pelo professor
+        // e já tem condições para uma jogada automática, ela dispara imediatamente.
+        // Em saves do jogador é no-op porque AUTO já estabilizou antes do save.
+        aplicarAutomaticos(m);
         printf("Jogo '%s' carregado.\n", nome);
-    else
-        printf("Nao encontrei o jogo guardado '%s'.\n", nome);
+    } else
+        printf("Nao encontrei o jogo guardado '%s' (procurei em saves/ e na pasta atual).\n", nome);
     pausa();
 }
 
@@ -99,12 +117,14 @@ static void mostrarAjuda(void) {
     // printf multi-linha otimizado do C (strings adjacentes fundem-se automaticamente).
     printf(
         "\n=== COMO JOGAR ===\n"
-        "  move <orig> <dest>     - move a carta (ou a sequencia movivel) entre pilhas\n"
-        "        ex:  move 0 3     (move o topo/sequencia da pilha 0 para a 3)\n"
+        "  move <orig> <dest> [n]  - move n cartas (ou a sequencia movivel se omitido)\n"
+        "        ex:  move 0 3      (move a maior sequencia possivel da pilha 0 para a 3)\n"
+        "        ex:  move 3 5 2    (move exatamente 2 cartas da pilha 3 para a 5)\n"
         "  d   - dica       (sugere uma jogada valida)\n"
         "  u   - desfazer   (anula a ultima jogada)\n"
-        "  g   - guardar [nome]   (grava o jogo;    ex:  g    ou    g partida1)\n"
-        "  c   - carregar [nome]  (retoma um jogo;  ex:  c partida1)\n"
+        "  g   - guardar [nome]   (grava em saves/<nome>.save;  ex:  g partida1)\n"
+        "  c   - carregar [nome]  (le saves/<nome>.save ou ficheiro .save direto;\n"
+        "                          ex:  c partida1  |  c golf-nearwin.save)\n"
         "  a   - ajuda      (mostra esta ajuda)\n"
         "  q   - sair       (termina o jogo)\n"
         "==================\n");
@@ -151,8 +171,13 @@ static int jogarTurno(MotorPaciencia *m) {
     m->dica_origem = -1; m->dica_destino = -1; m->dica_n = -1;
     
     if (verificarVitoria(m)) { printf("VITORIA! Paciencia resolvida.\n"); return 0; }
-    
-    printf("Comandos: move <o> <d> | d-dica | u-desfazer | g-guardar | c-carregar | a-ajuda | q-sair\n> ");
+    if (verificarDerrota(m)) {
+        printf("DERROTA! Sem jogadas validas. Carrega ENTER para terminar...\n");
+        char buf[16]; lerLinha(buf, sizeof(buf));
+        return 0;
+    }
+
+    printf("Comandos: move <o> <d> [n] | d-dica | u-desfazer | g-guardar | c-carregar | a-ajuda | q-sair\n> ");
     if (lerLinha(buf, sizeof(buf)) == 0) return 0; // Proteção EOF (Ctrl+D)
     
     return processarComando(m, buf);
@@ -163,6 +188,7 @@ static int prepararJogo(MotorPaciencia *m, const char *ficheiro) {
     inicializarMotor(m);
     if (carregarPaciencia(m, ficheiro) == 0) return 0; // Se o parser falhar, aborta a inicialização
     distribuirCartasMesa(m);
+    aplicarAutomaticos(m); // Cobre o caso raro em que a distribuição inicial já satisfaz uma regra AUTO.
     return 1;
 }
 
@@ -184,8 +210,11 @@ static int iniciar(MotorPaciencia *m) {
 }
 
 int main(void) {
-    // Alimenta o relógio interno do PC como "semente" para garantir baralhos aleatórios autênticos
-    srand((unsigned int)time(NULL));
+    /* Semente combinada (time + pid + clock): o time(NULL) tem precisão de 1
+     * segundo, por isso duas corridas seguidas davam o MESMO baralho. Misturar
+     * o PID (sempre diferente entre processos) e o clock() (ciclos de CPU desde
+     * o arranque) garante uma semente única por execução. */
+    srand((unsigned int)(time(NULL) ^ getpid() ^ clock()));
     
     MotorPaciencia motor;
     // MEDIDA DE SEGURANÇA: Garante que os apontadores da struct não começam a apontar para
