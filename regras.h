@@ -39,6 +39,11 @@ int procurarDica(MotorPaciencia *m, int *origem, int *destino, int *n);
  * contrário (e 0 se a paciência não definir qualquer regra WIN). */
 int verificarVitoria(MotorPaciencia *m);
 
+/* Devolve 1 se o jogo está em derrota: NÃO ganhou e não existe nenhuma
+ * jogada válida (procurarDica falha). Em paciências com STOCK→DESCARTE *
+ * isto significa, na prática, "stock vazio e nada combina no descarte". */
+int verificarDerrota(MotorPaciencia *m);
+
 /* Histórico para voltar atrás (undo). */
 void guardarHistorico(MotorPaciencia *m);   /* fotografa a mesa antes da jogada */
 void descartarHistorico(MotorPaciencia *m); /* anula a última fotografia        */
