@@ -115,10 +115,14 @@ static int validarUmaFlag(MotorPaciencia *m, int o, int d, int n, char f) {
 }
 
 /* Valida TODAS as flags de um comando MOV (conjunção).
- * '*' = sem restrições; '+' habilita mover sequências (n>1). */
+ * '*' = sem restrições estruturais; '+' habilita mover sequências (n>1).
+ * NOTA: '+' é verificado ANTES de '*' para que regras como
+ * "MOV STOCK DESCARTE *" continuem a limitar-se a 1 carta de cada vez
+ * (o que faz sentido para o baralho do Golf, p.ex.). Para mover várias
+ * tem de existir explicitamente o '+'. */
 static int validarFlags(MotorPaciencia *m, int o, int d, int n, const char *flags) {
-    if (strchr(flags, '*'))           return 1;
-    if (!strchr(flags, '+') && n > 1) return 0; // Proteção: impede mover várias cartas se a regra não tiver o '+'
+    if (!strchr(flags, '+') && n > 1) return 0; // Sem '+' obriga a n=1, mesmo com '*'
+    if (strchr(flags, '*'))           return 1; // '*' dispensa as restantes verificações
     int ok = 1;
     for (int i = 0; flags[i] != '\0'; i++)
         if (flags[i] != '+' && flags[i] != '*' &&
@@ -267,6 +271,15 @@ int verificarVitoria(MotorPaciencia *m) {
     return ganhou;
 }
 
+/* Derrota = não ganhou E não tem nenhuma jogada válida.
+   Reutilizamos procurarDica como "existe pelo menos uma jogada legal?" — se
+   ela falhar, o jogo está bloqueado e ainda não há WIN, logo é derrota. */
+int verificarDerrota(MotorPaciencia *m) {
+    if (verificarVitoria(m)) return 0;  // Se ganhou, não é derrota
+    int o, d, n;
+    return procurarDica(m, &o, &d, &n) == 0; // sem jogadas → derrota
+}
+
 /* ── Voltar atrás (undo): fotografias da mesa em listas copiadas ── */
 
 // Guarda uma cópia profunda da mesa antes de uma jogada.
@@ -302,7 +315,7 @@ int desfazerJogada(MotorPaciencia *m) {
     return 1;
 }
 
-/* ── Dica: encontrar uma jogada válida (reutiliza validarMovimento) ── */
+/* ── Dica: encontrar a MELHOR jogada válida (reutiliza validarMovimento) ── */
 
 // Procura o maior n que torne legal mover de o para d. 1 se achar (preenche *n).
 static int dicaPar(MotorPaciencia *m, int o, int d, int *n) {
@@ -315,18 +328,46 @@ static int dicaPar(MotorPaciencia *m, int o, int d, int *n) {
     return 0;
 }
 
-// Procura um destino para a origem o. 1 se achar (preenche *d e *n).
-static int dicaOrigem(MotorPaciencia *m, int o, int *d, int *n) {
-    int achou = 0;
-    for (int dd = 0; dd < m->num_pilhas && achou == 0; dd++)
-        if (dicaPar(m, o, dd, n)) { *d = dd; achou = 1; }
-    return achou;
+/* Pontuação heurística de uma jogada válida — quanto maior, melhor.
+ * Preferências (por ordem de peso):
+ *   +500  mesmo naipe entre o FUNDO do bloco e o TOPO do destino
+ *         (ex: 7♠ → 8♠ é melhor que 7♥ → 8♠ porque constrói sequência)
+ *   +100*n  blocos maiores são mais progresso por jogada
+ * O empate fica como está: a iteração escolhe a primeira jogada com o score
+ * mais alto, o que é determinístico e fácil de explicar na defesa. */
+static int pontuarJogada(MotorPaciencia *m, int o, int d, int n) {
+    int score = n * 100; /* preferimos blocos maiores */
+    if (!pilhaVazia(&m->mesa[d])) {
+        // Bónus por mesmo naipe entre o fundo do bloco e o topo do destino.
+        // Sobre pilhas vazias não há comparação possível (não há topo), por isso
+        // o bónus naipe não se aplica e fica só o peso do tamanho do bloco.
+        Cartas fundo = cartaNivel(&m->mesa[o], alturaPilha(&m->mesa[o]) - n);
+        Cartas topo  = cartaTopo(&m->mesa[d]);
+        if (fundo.naipe == topo.naipe) score += 500;
+    }
+    return score;
 }
 
-// Procura qualquer jogada válida no tabuleiro. 1 se achar (preenche *o,*d,*n).
+// Procura A MELHOR jogada válida no tabuleiro (maior pontuação).
+// 1 se achar (preenche *o,*d,*n); 0 se não existir jogada legal.
 int procurarDica(MotorPaciencia *m, int *origem, int *destino, int *n) {
+    int melhor_score = -1;
     int achou = 0;
-    for (int oo = 0; oo < m->num_pilhas && achou == 0; oo++)
-        if (dicaOrigem(m, oo, destino, n)) { *origem = oo; achou = 1; }
+
+    for (int o = 0; o < m->num_pilhas; o++)
+        for (int d = 0; d < m->num_pilhas; d++) {
+            int k;
+            // Saltamos pares (o,d) sem jogada legal.
+            if (dicaPar(m, o, d, &k) == 0) continue;
+
+            int s = pontuarJogada(m, o, d, k);
+            if (s > melhor_score) {
+                melhor_score = s;
+                *origem  = o;
+                *destino = d;
+                *n       = k;
+                achou    = 1;
+            }
+        }
     return achou;
 }
